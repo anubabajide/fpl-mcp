@@ -1,0 +1,10 @@
+{
+  "_comment": "Copy to .mcp.json in the PARENT directory of fpl-mcp, then replace <ABSOLUTE PATH> with where you cloned this. Registers the server for Claude Code.",
+  "mcpServers": {
+    "fpl": {
+      "command": "<ABSOLUTE PATH>/fpl-mcp/.venv/Scripts/python.exe",
+      "args": ["-m", "fpl_mcp"],
+      "cwd": "<ABSOLUTE PATH>/fpl-mcp"
+    }
+  }
+}

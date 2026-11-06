@@ -1,0 +1,20 @@
+# Bundled interpreter and dependencies — rebuild with `python -m venv .venv`
+.venv/
+
+# Build artifact: ~56 MB, regenerate with `python build_mcpb.py`
+*.mcpb
+
+# Local machine paths; copy .mcp.json.example and fill in your own
+.mcp.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# Belt and braces. The real ones live in ~/.fpl-mcp, outside this tree,
+# but never let a token, session profile or dotenv in here by accident.
+.env
+.env.*
+config.json
+browser-profile/
