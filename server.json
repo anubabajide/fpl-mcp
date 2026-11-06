@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.anubabajide/fpl",
   "title": "Fantasy Premier League",
-  "description": "Research and manage a Fantasy Premier League team through MCP.",
+  "description": "Research and manage a Fantasy Premier League team from any MCP-capable agent.",
   "repository": {
     "url": "https://github.com/anubabajide/fpl-mcp",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "fantasy-premier-league-mcp",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "transport": {
         "type": "stdio"
       },

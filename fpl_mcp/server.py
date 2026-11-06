@@ -1621,9 +1621,9 @@ async def fpl_make_transfers(
 def main() -> None:
     """Entry point. Defaults to stdio; `--http` serves streamable HTTP instead.
 
-    stdio is for local surfaces (Claude Code, Cowork). HTTP is for reaching
-    claude.ai as a custom connector, which means the endpoint is exposed beyond
-    this machine — so that mode refuses to start without a shared secret.
+    stdio is for local agents. HTTP is for remote MCP clients, which means the
+    endpoint is exposed beyond this machine — so that mode refuses to start
+    without a shared secret.
     """
     import os
     import sys

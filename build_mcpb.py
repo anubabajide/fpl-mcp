@@ -1,4 +1,4 @@
-"""Build fpl.mcpb, the installable Claude Desktop extension bundle.
+"""Build fpl.mcpb, the installable MCP Bundle.
 
 Run:  .venv/Scripts/python.exe build_mcpb.py
 
@@ -78,7 +78,7 @@ def main():
         "name": "fpl",
         "display_name": "Fantasy Premier League",
         "version": __version__,
-        "description": "Manage your Fantasy Premier League team from Claude.",
+        "description": "Manage your Fantasy Premier League team from any MCP-capable agent.",
         "long_description": (
             "Read your squad and season stats, rank the best performers in the game, "
             "work out differentials against global ownership or a specific mini-league, "

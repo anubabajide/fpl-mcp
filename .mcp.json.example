@@ -1,10 +1,9 @@
 {
-  "_comment": "Copy to .mcp.json in the PARENT directory of fpl-mcp, then replace <ABSOLUTE PATH> with where you cloned this. Registers the server for Claude Code.",
+  "_comment": "Example MCP client configuration. Copy the mcpServers block into your agent's configuration (some clients call the key 'servers').",
   "mcpServers": {
     "fpl": {
-      "command": "<ABSOLUTE PATH>/fpl-mcp/.venv/Scripts/python.exe",
-      "args": ["-m", "fpl_mcp"],
-      "cwd": "<ABSOLUTE PATH>/fpl-mcp"
+      "command": "uvx",
+      "args": ["fantasy-premier-league-mcp"]
     }
   }
 }

@@ -14,8 +14,8 @@ access token with a refresh token. This module does the same, so:
 The only thing written to disk is `credentials.json`, holding the refresh token
 and the current access token, readable only by the current user. Renewals are
 serialised across processes by a lock file: the identity provider may rotate
-the refresh token on every use, and two server processes (say Claude Desktop
-and Claude Code) racing on a rotated token would sign the user out.
+the refresh token on every use, and two server processes (say two agents) racing
+on a rotated token would sign the user out.
 """
 from __future__ import annotations
 

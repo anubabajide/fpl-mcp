@@ -2,8 +2,10 @@
 
 <!-- mcp-name: io.github.anubabajide/fpl -->
 
-An MCP server that lets Claude manage your Fantasy Premier League team — read your
-squad and stats, rank players, work out differentials, and make changes to your team.
+An MCP server for Fantasy Premier League that works with any MCP-capable agent —
+read your squad and stats, rank players, work out differentials, and make changes
+to your team. It is published in the official MCP Registry and works over either
+stdio or remote streamable HTTP.
 
 This project is packaged on PyPI as `fantasy-premier-league-mcp`, rather than
 `fpl-mcp`, which is already owned by an unrelated project.
@@ -54,72 +56,45 @@ Create a protected GitHub environment named `pypi` (for example, require manual
 approval). Once that one-time setup is complete, publish a prepared version with:
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 Playwright drives the one-off browser sign-in described under Authentication.
 
-## Connect it to Claude
+## Connect it to your agent
 
-Which surface you want decides the transport. **Do not hand-edit
-`claude_desktop_config.json`** — the desktop app owns that file and rewrites it,
-discarding anything you add.
+Any MCP-capable client can use this server. It speaks MCP over stdio by default,
+and can also run as a remote streamable-HTTP connector for agents that support
+remote MCP servers.
 
-### Claude Desktop / Cowork — install the extension (easiest)
+### Local stdio (recommended)
 
-`fpl.mcpb` in this folder is an **MCP Bundle**: a zip containing the server, its
-dependencies and a bundled Python interpreter, plus a `manifest.json`.
+Point your agent at `uvx`:
 
-1. Claude Desktop → **Settings → Extensions → Advanced settings**
-2. **Install Extension…** and pick `fpl.mcpb`
-3. Set your FPL Team ID (and optionally a default mini-league ID) when prompted
-
-You run nothing; the app launches the server itself. Rebuild after code changes
-with `uv run python build_mcpb.py` on Windows.
-
-#### Updating an installed version — stop the server first
-
-Installing over a running extension **fails**, with:
-
-```
-EPERM: operation not permitted, unlink '...\server\venv\Scripts\python.exe'
+```json
+{
+  "mcpServers": {
+    "fpl": {
+      "command": "uvx",
+      "args": ["fantasy-premier-league-mcp"]
+    }
+  }
+}
 ```
 
-The bundle ships its own interpreter, and Windows will not let anything delete a
-running `.exe`. The installer deletes the old files before writing new ones, so
-it dies partway and leaves the extension broken — manifest gone, venv stranded.
+Use that block in your client's MCP configuration — many clients accept a
+`.mcp.json`/`.cursor/mcp.json` file or offer a settings screen. Some clients call
+the top-level key `servers` instead of `mcpServers`; the `fpl` entry is the same.
+For a checked-out copy, point `command` at the project's Python and run
+`python -m fpl_mcp`.
 
-Update in this order:
+Nothing is exposed off the machine in stdio mode. This is the safest option.
 
-1. **Uninstall** the extension in Settings → Extensions (this stops the server), or
-   quit Claude Desktop entirely
-2. Confirm nothing is left running:
-   `Get-CimInstance Win32_Process -Filter "Name='python.exe'"` — no path should
-   point inside `Claude Extensions`
-3. Delete `%APPDATA%\Claude\Claude Extensions\local.mcpb.<author>.fpl` if it
-   survived (`<author>` is the manifest author, overridable with `MCPB_AUTHOR`)
-4. Install the new `fpl.mcpb`
+### Remote HTTP
 
-This is inherent to bundling a runtime with native modules; a running process
-holds locks on its own interpreter and `.pyd` files.
-
-The bundle carries Playwright but **not** its Chromium (~150 MB), which lives at
-a machine-level path. Already present here; on a fresh machine run
-`playwright install chromium` first, or browser sign-in will fail.
-
-### Local surfaces (Claude Code) — stdio
-
-Already set up: see `../.mcp.json`, which points Claude Code at this venv's
-Python with `-m fpl_mcp`. Paths in that file are JSON, so backslashes are
-doubled. Reload the session to pick up changes.
-
-Nothing is exposed off the machine. This is the safest option.
-
-### claude.ai chat — streamable HTTP
-
-claude.ai cannot reach a local stdio server at any price; it only talks to
-remote connectors over HTTPS. Run the server in HTTP mode and expose it:
+Agents that connect to remote MCP servers over HTTPS can use the built-in HTTP
+transport:
 
 ```bash
 export FPL_MCP_SHARED_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
@@ -127,8 +102,8 @@ python -m fpl_mcp --http
 ```
 
 Then put an HTTPS tunnel in front of it (for example
-`cloudflared tunnel --url http://localhost:8000`) and add the resulting
-`https://…/mcp` URL as a custom connector in claude.ai.
+`cloudflared tunnel --url http://localhost:8000`) and give the agent the resulting
+`https://…/mcp` URL as a custom connector.
 
 **HTTP mode refuses to start without `FPL_MCP_SHARED_SECRET`** (16+ characters).
 These tools can transfer players and rewrite your lineup, so an open endpoint
@@ -136,12 +111,25 @@ would let anyone who found the URL edit your team. Every request must carry
 `Authorization: Bearer <secret>`; anything else gets a 401. Your machine has to
 be running for the connector to work.
 
+### MCP Bundle
+
+For apps that install local MCP servers as bundles, `fpl.mcpb` is a zip containing
+the server, its dependencies and a bundled Python interpreter, plus a
+`manifest.json`. Install it through the app's extension UI. See the
+[MCP Bundle setup notes](docs/mcpb.md) for build, update and Chromium details.
+
+### Registry discovery
+
+The server is listed in the official MCP Registry as
+`io.github.anubabajide/fpl`, so registry-aware clients can find and install it
+directly.
+
 ## Authentication
 
 Everything read-only works with no login at all. Only the three write tools
 (`fpl_set_lineup`, `fpl_set_captain`, `fpl_make_transfers`) need a session.
 
-**Sign in once:** ask Claude to run `fpl_login`. It opens FPL's own sign-in page
+**Sign in once:** ask your agent to run `fpl_login`. It opens FPL's own sign-in page
 in a browser window on the machine running the server and returns promptly:
 
 1. Sign in in that browser window.
