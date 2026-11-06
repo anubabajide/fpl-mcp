@@ -15,6 +15,136 @@ CHIP_LABELS = {
     "manager": "Assistant Manager",
 }
 
+# Chips that FPL plays through the team-save request (`fpl_set_lineup`).
+LINEUP_CHIPS = frozenset({"3xc", "bboost"})
+# Chips that FPL plays through the transfers request (`fpl_make_transfers`).
+TRANSFER_CHIPS = frozenset({"wildcard", "freehit"})
+
+_CHIP_ALIASES = {
+    "3xc": "3xc",
+    "tc": "3xc",
+    "triplecaptain": "3xc",
+    "triple captain": "3xc",
+    "triple_captain": "3xc",
+    "bboost": "bboost",
+    "bb": "bboost",
+    "benchboost": "bboost",
+    "bench boost": "bboost",
+    "bench_boost": "bboost",
+    "freehit": "freehit",
+    "fh": "freehit",
+    "free hit": "freehit",
+    "free_hit": "freehit",
+    "wildcard": "wildcard",
+    "wc": "wildcard",
+}
+
+
+def normalise_chip(chip: str | None, allowed: Iterable[str] | None = None) -> str | None:
+    """Map a chip name or code to FPL's code, rejecting unsupported chips."""
+    if chip is None:
+        return None
+    key = str(chip).strip().lower()
+    code = _CHIP_ALIASES.get(key) or _CHIP_ALIASES.get(key.replace(" ", "_"))
+    if code is None:
+        raise ValueError(
+            "Unknown chip " + repr(chip) + ". Use one of: "
+            + ", ".join(sorted(allowed or CHIP_LABELS))
+            + " (or omit it)."
+        )
+    if allowed is not None and code not in allowed:
+        raise ValueError(
+            "Chip " + repr(chip) + " cannot be played here. Use one of: "
+            + ", ".join(sorted(allowed))
+            + "."
+        )
+    return code
+
+
+def transfer_allowance(
+    transfers: dict, new_transfers: int, chip: str | None = None
+) -> dict:
+    """Work out free transfers remaining and the points hit for a transfer batch.
+
+    FPL's my-team payload reports `limit` (free transfers granted for the
+    gameweek), `made` (transfers already made) and `cost` (points already paid).
+    `limit` is *not* the number still available: remaining is `limit - made`.
+    """
+    granted = int(transfers.get("limit") or 0)
+    made = int(transfers.get("made") or 0)
+    already_hit = int(transfers.get("cost") or 0)
+    remaining = max(0, granted - made)
+
+    if chip in TRANSFER_CHIPS:
+        # Wildcard and Free Hit transfers are unlimited and free; they do not
+        # consume (or add to) the paid-transfer allowance.
+        total_hit = already_hit
+        new_hit = 0
+        remaining_after = remaining
+    else:
+        paid_before = max(0, made - granted)
+        paid_after = max(0, made + new_transfers - granted)
+        new_hit = (paid_after - paid_before) * 4
+        total_hit = max(already_hit, paid_before * 4) + new_hit
+        remaining_after = max(0, granted - made - new_transfers)
+
+    return {
+        "free_transfers_granted": granted,
+        "transfers_made_this_gw": made,
+        "free_transfers_available": remaining,
+        "free_transfers_remaining_after": remaining_after,
+        "points_hit_already": already_hit,
+        "points_hit": new_hit,
+        "points_hit_total": total_hit,
+    }
+
+
+def chip_state(live: dict) -> dict:
+    """Split FPL's per-entry chip list into held, active and playable chips.
+
+    `chips_available` means chips still held, not "chips playable this
+    gameweek". While a chip is active, FPL marks the others unavailable, so a
+    filter on `status_for_entry == "available"` hides chips the manager still
+    owns.
+    """
+    held: list[str] = []
+    playable: list[str] = []
+    active: str | None = None
+    details: list[dict] = []
+
+    for chip in live.get("chips") or []:
+        code = chip.get("name")
+        label = CHIP_LABELS.get(code, code)
+        status = chip.get("status_for_entry")
+        details.append(
+            {
+                "code": code,
+                "chip": label,
+                "status": status,
+                "start_event": chip.get("start_event"),
+                "stop_event": chip.get("stop_event"),
+            }
+        )
+        if status == "active":
+            active = label
+        elif status == "available":
+            held.append(label)
+            playable.append(label)
+        elif status != "played":
+            # Unavailable for now (for example a second-half chip), but held.
+            held.append(label)
+
+    if active is not None:
+        # FPL allows one chip per gameweek.
+        playable = []
+
+    return {
+        "chips_available": held,
+        "active_chip": active,
+        "chips_playable_this_gw": playable,
+        "chips": details,
+    }
+
 
 # --------------------------------------------------------------------- squads
 def describe_squad(index: Index, picks: list[dict]) -> dict:

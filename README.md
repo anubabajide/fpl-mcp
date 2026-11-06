@@ -56,8 +56,8 @@ Create a protected GitHub environment named `pypi` (for example, require manual
 approval). Once that one-time setup is complete, publish a prepared version with:
 
 ```bash
-git tag v0.3.1
-git push origin v0.3.1
+git tag v0.3.2
+git push origin v0.3.2
 ```
 
 Playwright drives the one-off browser sign-in described under Authentication.
@@ -197,15 +197,15 @@ hour, cannot renew itself, and is retained only until the server stops.
 ### Your team
 | Tool | What it does |
 |---|---|
-| `fpl_my_squad` | Starting XI, bench, captain, formation, bank, free transfers |
+| `fpl_my_squad` | Starting XI, bench, captain, formation, bank, free transfers remaining, held chips |
 | `fpl_season_summary` | Points, overall rank, rank by gameweek, chips, hits, past seasons |
-| `fpl_gameweek_report` | Per-player scoring for a gameweek, incl. bench and auto-subs |
+| `fpl_gameweek_report` | Per-player scoring for a gameweek, incl. bench and auto-subs; live or confirmed headline |
 | `fpl_best_performers` | Rank your own squad to see who is carrying and who is dead weight |
 
 ### Player research
 | Tool | What it does |
 |---|---|
-| `fpl_top_players` | Best players in the game, filtered by position, club and price |
+| `fpl_top_players` | Best players in the game, filtered by position, club and price; ranked by `metric` or `sort_by` |
 | `fpl_player` | One player in depth: stats, fixtures, set pieces, injury news |
 | `fpl_compare_players` | Two or more players side by side |
 | `fpl_search_players` | Name lookup |
@@ -214,7 +214,7 @@ hour, cannot renew itself, and is retained only until the server stops.
 ### Bulk export (for your own modelling)
 | Tool | What it does |
 |---|---|
-| `fpl_export_players` | Every player, many columns, as CSV — the full pool, unranked |
+| `fpl_export_players` | Compact player-pool export as CSV — full pool or paged, unranked |
 | `fpl_export_fixtures` | Every fixture over a horizon, one row per team per match |
 | `fpl_export_gameweek_history` | Per-player, per-gameweek stats across finished gameweeks |
 
@@ -222,9 +222,11 @@ These return whole datasets rather than a ranked top-N, so a client can run its
 own optimiser. CSV is the default: the same data as JSON costs roughly five
 times the tokens.
 
-The default player export is 599 players x 62 columns, about 32k tokens.
-`fields="all"` gives 112 columns and about 89k tokens, and warns you. Narrow it
-with `fields`, `position`, `team` or `max_price`.
+The default player export is compact — about 22 columns — so it fits in a tool
+result. `fields="standard"` restores the broad optimiser set (62 columns), and
+`fields="all"` gives every raw column (112) with a size warning. Narrow further
+with `ids`, `position`, `team`, `min_minutes` or `max_price`, or page with
+`offset`/`limit`; the response carries `has_more` and `next_offset`.
 
 Join `fpl_export_fixtures` to the player export on `team_id` to build
 per-player, per-gameweek projections. Blanks and doubles fall out of the shape:
@@ -281,8 +283,8 @@ press conference.
 | Tool | What it does |
 |---|---|
 | `fpl_set_captain` | Move the armband, keeping the XI as-is |
-| `fpl_set_lineup` | Set the full XI, bench order, captain and vice |
-| `fpl_make_transfers` | Transfer players in and out, optionally on a chip |
+| `fpl_set_lineup` | Set the full XI, bench order, captain and vice; may play Bench Boost or Triple Captain |
+| `fpl_make_transfers` | Transfer players in and out, optionally on a wildcard or free hit |
 
 ## How differentials work
 
@@ -329,6 +331,42 @@ Before submitting, the server checks the change against FPL's own rules:
 If any check fails, nothing is submitted and the problems are listed instead. The
 points cost of extra transfers is calculated from your actual free-transfer count,
 and set to zero when you play a wildcard or free hit.
+
+## Gameweek deadlines
+
+Both `fpl_my_squad` and `fpl_export_fixtures` return the next gameweek deadline,
+in FPL's UTC format and converted to UK local time, taken from FPL's own bootstrap
+`deadline_time`:
+
+- `next_deadline_utc` — e.g. `2026-11-07T11:00:00Z`
+- `next_deadline_uk` / `next_deadline_uk_display` — the same instant in Europe/London
+
+`fpl_export_fixtures` also lists `gameweek_deadlines` for each gameweek in its
+window.
+
+## Changelogs
+
+### 0.3.2
+
+- Fixed `free_transfers` / `free_transfers_available` to be transfers remaining
+  (`FPL's limit` minus transfers already made), and compute points hits from it
+  instead of treating the granted allowance as the remaining balance. Dry runs now
+  report the correct hit, including transfers already made this gameweek.
+- `fpl_set_lineup` now accepts `chip` (`bboost` or `3xc`) and reports whether FPL
+  confirmed it after submission; Bench Boost and Triple Captain can be played in
+  the dry-run flow.
+- `fpl_gameweek_report` now returns consistent headline `points`, `points_on_bench`
+  and `overall_rank` for live gameweeks, alongside confirmed values and an `as_of`
+  marker, instead of mixing stored history with live player rows.
+- `fpl_my_squad` `chips_available` now lists held chips, with `active_chip` and
+  `chips_playable_this_gw` as the per-gameweek view.
+- Player references (element ids) are accepted by the transfer, lineup and
+  captain tools.
+- `fpl_top_players` accepts `sort_by` as an alias for `metric`.
+- `fpl_export_players` defaults to a compact field set and adds `ids`, `offset` and
+  `limit` so responses fit tool-result limits.
+- New: the gameweek deadline (`next_deadline_utc`, UK local time) is returned by
+  `fpl_my_squad` and `fpl_export_fixtures`.
 
 ## A note on pre-season
 

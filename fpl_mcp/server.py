@@ -4,18 +4,24 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
 from .analysis import (
     CHIP_LABELS,
+    LINEUP_CHIPS,
+    TRANSFER_CHIPS,
     best_performers,
+    chip_state,
     describe_squad,
     differentials,
     fixture_ticker,
     league_ownership,
+    normalise_chip,
     squad_totals,
+    transfer_allowance,
     validate_lineup,
     validate_squad,
 )
@@ -23,7 +29,6 @@ from . import __version__, auth
 from .client import AuthError, FPLClient, FPLError
 from .export import (
     LIVE_ROW_FIELDS,
-    STANDARD_FIELDS,
     fixtures_by_gameweek,
     live_rows,
     player_rows,
@@ -31,7 +36,7 @@ from .export import (
     to_csv,
 )
 from .config import Config
-from .index import METRICS, Index, sort_players
+from .index import METRICS, Index, deadline_info, sort_players
 from .lineups import predict_xi, start_rates
 from .pulse import PulseClient, lineup_players
 
@@ -108,6 +113,12 @@ def season_note(index: Index) -> dict:
         "current_gameweek": index.current_event,
         "next_gameweek": index.next_event,
     }
+    deadline = index.next_deadline
+    if deadline:
+        note["next_deadline_gameweek"] = deadline.get("gameweek")
+        note["next_deadline_utc"] = deadline.get("deadline_time_utc")
+        note["next_deadline_uk"] = deadline.get("deadline_time_uk")
+        note["next_deadline_uk_display"] = deadline.get("deadline_time_uk_display")
     if index.season_stage == "preseason":
         note["caveat"] = (
             "The season has not kicked off yet. Until gameweek 1 completes, FPL "
@@ -359,8 +370,13 @@ async def fpl_set_token(token: str) -> dict:
 async def fpl_my_squad(team_id: int | None = None, gameweek: int | None = None) -> dict:
     """Show your current squad: starting XI, bench, captain, value and bank.
 
-    With a valid token this reflects unsaved live state including selling prices
-    and free transfers. Without one it falls back to your last confirmed squad.
+    With a valid token this reflects unsaved live state including selling prices,
+    free transfers remaining, and chip state. `free_transfers` is the number
+    still available this gameweek (FPL's `limit` minus transfers already made).
+    `chips_available` lists chips still held; `active_chip` is the chip currently
+    playing, and `chips_playable_this_gw` is what can still be played now.
+
+    Without a token it falls back to your last confirmed squad.
     """
     client = get_client()
     index = await get_index()
@@ -384,13 +400,13 @@ async def fpl_my_squad(team_id: int | None = None, gameweek: int | None = None) 
             result["source"] = "live (authenticated)"
             result["bank"] = transfers.get("bank", 0) / 10
             result["squad_value_incl_bank"] = transfers.get("value", 0) / 10
-            result["free_transfers"] = transfers.get("limit")
-            result["transfers_made_this_gw"] = transfers.get("made")
-            result["chips_available"] = [
-                CHIP_LABELS.get(c.get("name"), c.get("name"))
-                for c in live.get("chips", [])
-                if c.get("status_for_entry") == "available"
-            ]
+            allowance = transfer_allowance(transfers, 0)
+            result["free_transfers"] = allowance["free_transfers_available"]
+            result["free_transfers_remaining"] = allowance["free_transfers_available"]
+            result["free_transfers_granted"] = allowance["free_transfers_granted"]
+            result["transfers_made_this_gw"] = allowance["transfers_made_this_gw"]
+            result["points_hit_this_gw"] = allowance["points_hit_already"]
+            result.update(chip_state(live))
         except AuthError as exc:
             result["auth_warning"] = str(exc)
 
@@ -521,15 +537,51 @@ async def fpl_gameweek_report(gameweek: int | None = None, team_id: int | None =
         if s.get("element_in") in index.players and s.get("element_out") in index.players
     ]
     played = [r for r in rows if r["started"]]
+    bench = [r for r in rows if not r["started"]]
+    event_data = index.event(event) or {}
+    is_live = bool(event_data.get("is_current") and not event_data.get("finished"))
+
+    transfer_cost = history.get("event_transfers_cost") or 0
+    live_points = sum(r["points"] for r in played)
+    live_bench_points = sum(r["points"] for r in bench)
+    provisional_points = live_points - transfer_cost
+
+    live_rank = None
+    if is_live:
+        try:
+            entry = await client.entry(entry_id)
+            live_rank = entry.get("summary_overall_rank")
+        except FPLError:
+            pass
+
+    headline_points = provisional_points if is_live else history.get("points")
+    headline_rank = live_rank if is_live and live_rank is not None else history.get("overall_rank")
+    headline_bench = live_bench_points if is_live else history.get("points_on_bench")
+
     return {
         "team_id": entry_id,
         "gameweek": event,
-        "points": history.get("points"),
-        "transfer_cost": history.get("event_transfers_cost"),
-        "points_on_bench": history.get("points_on_bench"),
-        "overall_rank": history.get("overall_rank"),
+        "points": headline_points,
+        "points_confirmed": history.get("points"),
+        "points_from_players": live_points,
+        "transfer_cost": transfer_cost,
+        "points_on_bench": headline_bench,
+        "points_on_bench_confirmed": history.get("points_on_bench"),
+        "overall_rank": headline_rank,
+        "overall_rank_confirmed": history.get("overall_rank"),
         "gameweek_rank": history.get("rank"),
-        "average_entry_score": (index.event(event) or {}).get("average_entry_score"),
+        "is_live": is_live,
+        "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "headline_source": "live" if is_live else "confirmed",
+        "headline_note": (
+            "The gameweek is still in progress: points, bench points and rank are "
+            "computed from the player rows in this response and will change until "
+            "the gameweek finishes. Confirmed fields come from FPL's stored entry "
+            "history and can lag the live data."
+            if is_live
+            else "The gameweek is finished, so headline fields come from FPL's confirmed entry history."
+        ),
+        "average_entry_score": event_data.get("average_entry_score"),
         "captain_returned": next(
             (r["points"] for r in rows if r["captain"]), None
         ),
@@ -595,6 +647,7 @@ async def _current_squad_ids(client: FPLClient, index: Index, entry_id: int) -> 
 @server.tool()
 async def fpl_top_players(
     metric: str | None = None,
+    sort_by: str | None = None,
     position: str | None = None,
     team: str | None = None,
     max_price: float | None = None,
@@ -606,10 +659,16 @@ async def fpl_top_players(
     """Find the best performing players in the game, with optional filters.
 
     Filter by position (GKP/DEF/MID/FWD), club, and price. Metrics are the same
-    set as `fpl_best_performers`.
+    set as `fpl_best_performers`. `sort_by` is accepted as an alias for
+    `metric`, so either name works.
     """
     index = await get_index()
-    chosen = resolve_metric(index, metric)
+    if metric is not None and sort_by is not None and metric != sort_by:
+        raise ValueError(
+            "Pass either metric or sort_by, not both (got "
+            + repr(metric) + " and " + repr(sort_by) + ")."
+        )
+    chosen = resolve_metric(index, metric or sort_by)
     pool = index.filter(
         position=position,
         team=team,
@@ -637,7 +696,7 @@ async def fpl_search_players(query: str, limit: int = 10) -> dict:
 
 
 @server.tool()
-async def fpl_player(player: str, horizon: int = 5) -> dict:
+async def fpl_player(player: int | str, horizon: int = 5) -> dict:
     """Full detail on one player: season stats, upcoming fixtures and recent form.
 
     `player` accepts a name or an element id.
@@ -687,7 +746,7 @@ async def fpl_player(player: str, horizon: int = 5) -> dict:
 
 
 @server.tool()
-async def fpl_compare_players(players: list[str], metric: str | None = None) -> dict:
+async def fpl_compare_players(players: list[int | str], metric: str | None = None) -> dict:
     """Compare two or more players side by side on the headline stats."""
     index = await get_index()
     chosen = resolve_metric(index, metric)
@@ -923,17 +982,21 @@ async def fpl_export_players(
     min_price: float | None = None,
     min_minutes: int = 0,
     available_only: bool = False,
+    ids: list[int | str] | None = None,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict:
-    """Dump the whole player pool for your own modelling — every player, many columns.
+    """Dump the player pool for your own modelling, with a compact default.
 
-    Unlike `fpl_top_players` this does not rank or truncate: it returns the full
-    pool so you can run your own optimiser (e.g. maximise projected points
-    subject to budget, the 2/5/5/3 split and the three-per-club cap).
+    Unlike `fpl_top_players` this does not rank, but it does page: the default
+    response is a compact field set so it fits in a tool result. Pass
+    `fields="standard"` for the broad optimiser columns, or `fields="all"` for
+    every raw column (usually too large to return in one call).
 
-    `fields` defaults to a broad optimiser-oriented set: price, every scoring
-    stat, the expected-goals columns, availability, and set-piece duty order.
-    Pass "all" for every raw column, or a comma-separated list to narrow it.
-    `format` is "csv" (default, far more compact) or "json".
+    `fields` accepts "compact" (default), "standard", "all", or a
+    comma-separated list. Narrow with `ids`, `position`, `team`, price and
+    minutes filters, then use `offset`/`limit` to page. `format` is "csv"
+    (default, far more compact) or "json".
     """
     index = await get_index()
     chosen = resolve_fields(index, fields)
@@ -941,11 +1004,28 @@ async def fpl_export_players(
         position=position, team=team, max_price=max_price, min_price=min_price,
         min_minutes=min_minutes, available_only=available_only,
     )
+    if ids:
+        wanted = {index.resolve(ref).id for ref in ids}
+        pool = [p for p in pool if p.id in wanted]
     pool.sort(key=lambda p: p.id)
-    rows = player_rows(index, pool, chosen)
+
+    total_matching = len(pool)
+    start = max(0, int(offset))
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be zero or greater, or omitted for no limit.")
+    selected = pool[start:] if limit is None else pool[start:start + limit]
+    rows = player_rows(index, selected, chosen)
+    next_offset = start + len(rows)
+    has_more = next_offset < total_matching
 
     result: dict[str, Any] = {
         "player_count": len(rows),
+        "total_matching": total_matching,
+        "returned_from": start,
+        "offset": start,
+        "limit": limit,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
         "field_count": len(chosen),
         "fields": chosen,
         **season_note(index),
@@ -953,6 +1033,8 @@ async def fpl_export_players(
             "price is in millions; FPL's raw now_cost is tenths.",
             "element_type: 1=GKP 2=DEF 3=MID 4=FWD. Squad rules: 2/5/5/3, "
             "max 3 per team_id, 100.0m budget.",
+            "fields='standard' restores the broad optimiser columns; "
+            "fields='all' returns every raw column.",
             "penalties_order / direct_freekicks_order / "
             "corners_and_indirect_freekicks_order: 1 means first choice, "
             "empty means no listed duty. The matching *_text fields are empty "
@@ -970,8 +1052,13 @@ async def fpl_export_players(
     if result["approx_tokens"] > 50_000:
         result["size_warning"] = (
             "This payload is roughly " + str(result["approx_tokens"] // 1000)
-            + "k tokens. Narrow it with `fields`, `position` or `max_price` "
-            "unless you genuinely need every column."
+            + "k tokens. Narrow it with `ids`, `fields`, `position`, `team` or "
+            "`max_price`, or page it with `offset`/`limit`."
+        )
+    elif has_more:
+        result["paging_note"] = (
+            "More players match. Call again with offset=" + str(next_offset)
+            + " to fetch the next page."
         )
     return result
 
@@ -1001,10 +1088,21 @@ async def fpl_export_fixtures(horizon: int = 8, start_gameweek: int | None = Non
                and x["team_id"] == r["team_id"]) > 1
     })
     fields = list(rows[0].keys()) if rows else []
+    deadlines = []
+    for gw in window:
+        info = deadline_info(index.event(gw))
+        if info:
+            deadlines.append(info)
+    first_deadline = next((d for d in deadlines if d.get("gameweek") == start), None)
     return {
         "from_gameweek": start,
         "horizon": horizon,
         "row_count": len(rows),
+        **season_note(index),
+        "first_deadline_utc": (first_deadline or {}).get("deadline_time_utc"),
+        "first_deadline_uk": (first_deadline or {}).get("deadline_time_uk"),
+        "first_deadline_uk_display": (first_deadline or {}).get("deadline_time_uk_display"),
+        "gameweek_deadlines": deadlines,
         "teams_with_a_blank_in_window": blanks,
         "double_gameweeks": [{"gameweek": gw, "team": t} for gw, t in doubles],
         "notes": [
@@ -1332,8 +1430,8 @@ async def fpl_predicted_lineups(
 # =================================================================== writes
 @server.tool()
 async def fpl_set_captain(
-    captain: str,
-    vice_captain: str | None = None,
+    captain: int | str,
+    vice_captain: int | str | None = None,
     dry_run: bool = True,
     team_id: int | None = None,
 ) -> dict:
@@ -1394,10 +1492,11 @@ async def fpl_set_captain(
 
 @server.tool()
 async def fpl_set_lineup(
-    starting_xi: list[str],
-    bench_order: list[str],
-    captain: str,
-    vice_captain: str,
+    starting_xi: list[int | str],
+    bench_order: list[int | str],
+    captain: int | str,
+    vice_captain: int | str,
+    chip: str | None = None,
     dry_run: bool = True,
     team_id: int | None = None,
 ) -> dict:
@@ -1407,12 +1506,17 @@ async def fpl_set_lineup(
     substitute goalkeeper first, then outfielders in the order they should come
     on. Names or element ids both work.
 
+    `chip` plays a chip with this lineup: "bboost" (Bench Boost) or "3xc"
+    (Triple Captain). The response reports whether FPL confirmed the chip as
+    active. Wildcard and Free Hit are played through `fpl_make_transfers`.
+
     Runs as a preview by default. Show the preview to the user and get their
     agreement before calling again with dry_run=false.
     """
     client = get_client()
     index = await get_index()
     entry_id = require_team_id(team_id)
+    chip_code = normalise_chip(chip, LINEUP_CHIPS) if chip else None
 
     live = await client.my_team(entry_id)
     owned = {p["element"] for p in live.get("picks", [])}
@@ -1443,7 +1547,13 @@ async def fpl_set_lineup(
         for slot, player in enumerate(ordered, start=1)
     ]
     return await _submit_lineup(
-        client, index, entry_id, picks, dry_run, extra={"change": "lineup"}
+        client,
+        index,
+        entry_id,
+        picks,
+        dry_run,
+        chip=chip_code,
+        extra={"change": "lineup"},
     )
 
 
@@ -1453,6 +1563,7 @@ async def _submit_lineup(
     entry_id: int,
     picks: list[dict],
     dry_run: bool,
+    chip: str | None = None,
     extra: dict | None = None,
 ) -> dict:
     payload = [
@@ -1471,6 +1582,8 @@ async def _submit_lineup(
         "valid": not problems,
         "problems": problems,
         "squad": describe_squad(index, payload),
+        "chip": chip,
+        "chip_label": CHIP_LABELS.get(chip, chip) if chip else None,
         **(extra or {}),
     }
     if problems:
@@ -1479,21 +1592,62 @@ async def _submit_lineup(
         return result
     if dry_run:
         result["submitted"] = False
+        result["chip_confirmed"] = False
         result["message"] = (
             "Preview only. Confirm with the user, then call again with dry_run=false."
+            + (
+                " This would play " + CHIP_LABELS.get(chip, chip) + "."
+                if chip
+                else ""
+            )
         )
         return result
 
-    await client.post_lineup(entry_id, payload)
+    await client.post_lineup(entry_id, payload, chip=chip)
     result["submitted"] = True
-    result["message"] = "Lineup saved to your FPL team."
+    result.update(await _confirm_chip(client, entry_id, chip))
+    result["message"] = (
+        "Lineup saved to your FPL team."
+        + (
+            " " + CHIP_LABELS.get(chip, chip) + " is confirmed active."
+            if chip and result.get("chip_confirmed")
+            else (
+                " FPL accepted the lineup but has not reported "
+                + CHIP_LABELS.get(chip, chip)
+                + " as active yet; check your squad."
+                if chip
+                else ""
+            )
+        )
+    )
     return result
+
+
+async def _confirm_chip(client: FPLClient, entry_id: int, chip: str | None) -> dict:
+    """Re-read the team after a write and report the chip state FPL now holds."""
+    if not chip:
+        return {"chip_confirmed": False}
+    try:
+        live = await client.my_team(entry_id)
+    except (FPLError, AuthError):
+        return {"chip_confirmed": None}
+    state = chip_state(live)
+    confirmed = any(
+        detail.get("code") == chip and detail.get("status") in ("active", "played")
+        for detail in state["chips"]
+    )
+    return {
+        "chip_confirmed": confirmed,
+        "active_chip": state["active_chip"],
+        "chips_available": state["chips_available"],
+        "chips_playable_this_gw": state["chips_playable_this_gw"],
+    }
 
 
 @server.tool()
 async def fpl_make_transfers(
-    players_out: list[str],
-    players_in: list[str],
+    players_out: list[int | str],
+    players_in: list[int | str],
     chip: str | None = None,
     dry_run: bool = True,
     team_id: int | None = None,
@@ -1501,11 +1655,13 @@ async def fpl_make_transfers(
     """Transfer players out of and into your squad.
 
     Pass matching lists of names or element ids. `chip` may be "wildcard" or
-    "freehit" to play that chip with these transfers.
+    "freehit" to play that chip with these transfers. Bench Boost and Triple
+    Captain are played through `fpl_set_lineup`, not here.
 
     Runs as a preview by default, reporting the cost in points, the resulting
-    bank balance and any rule breaches. Show that preview to the user and get
-    their agreement before calling again with dry_run=false.
+    bank balance and any rule breaches. `points_hit` is the cost of these
+    transfers; `points_hit_total` is the whole gameweek's hit. Show that preview
+    to the user and get their agreement before calling again with dry_run=false.
     """
     client = get_client()
     index = await get_index()
@@ -1518,8 +1674,7 @@ async def fpl_make_transfers(
         )
     if not players_out:
         raise ValueError("No transfers given.")
-    if chip is not None and chip not in ("wildcard", "freehit"):
-        raise ValueError("chip must be 'wildcard', 'freehit', or omitted.")
+    chip_code = normalise_chip(chip, TRANSFER_CHIPS) if chip else None
 
     event = index.next_event or index.current_event
     if event is None:
@@ -1579,21 +1734,22 @@ async def fpl_make_transfers(
             + "m but you only have " + str(round(bank / 10, 1)) + "m in the bank."
         )
 
-    free_transfers = transfers_meta.get("limit") or 0
-    if chip in ("wildcard", "freehit"):
-        hit = 0
-    else:
-        extra_transfers = max(0, len(transfers) - free_transfers)
-        hit = extra_transfers * 4
+    allowance = transfer_allowance(transfers_meta, len(transfers), chip_code)
 
     result: dict[str, Any] = {
         "team_id": entry_id,
         "gameweek": event,
         "dry_run": dry_run,
-        "chip": chip,
+        "chip": chip_code,
+        "chip_label": CHIP_LABELS.get(chip_code, chip_code) if chip_code else None,
         "transfers": lines,
-        "free_transfers_available": free_transfers,
-        "points_hit": hit,
+        "free_transfers_available": allowance["free_transfers_available"],
+        "free_transfers_granted": allowance["free_transfers_granted"],
+        "transfers_made_this_gw": allowance["transfers_made_this_gw"],
+        "free_transfers_remaining_after": allowance["free_transfers_remaining_after"],
+        "points_hit_already": allowance["points_hit_already"],
+        "points_hit": allowance["points_hit"],
+        "points_hit_total": allowance["points_hit_total"],
         "bank_before": round(bank / 10, 1),
         "bank_after": round(remaining_bank / 10, 1),
         "valid": not problems,
@@ -1607,13 +1763,14 @@ async def fpl_make_transfers(
         result["submitted"] = False
         result["message"] = (
             "Preview only. Confirm with the user"
-            + (" (this costs " + str(hit) + " points)" if hit else "")
+            + (" (this costs " + str(allowance["points_hit"]) + " points)" if allowance["points_hit"] else "")
             + ", then call again with dry_run=false."
         )
         return result
 
-    await client.post_transfers(entry_id, event, transfers, chip=chip)
+    await client.post_transfers(entry_id, event, transfers, chip=chip_code)
     result["submitted"] = True
+    result.update(await _confirm_chip(client, entry_id, chip_code))
     result["message"] = "Transfers confirmed with FPL."
     return result
 

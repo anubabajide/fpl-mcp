@@ -2,7 +2,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
+
+try:  # Windows ships without the system tz database.
+    from zoneinfo import ZoneInfo
+
+    _UK_TZ = ZoneInfo("Europe/London")
+except Exception:  # pragma: no cover - only on systems without tzdata
+    _UK_TZ = timezone.utc
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def deadline_info(event: dict | None) -> dict | None:
+    """Return FPL's deadline in UTC and UK local time for one event."""
+    if not event:
+        return None
+    raw = event.get("deadline_time")
+    parsed = _parse_utc(raw)
+    if parsed is None:
+        return {
+            "gameweek": event.get("id"),
+            "deadline_time_utc": raw,
+        }
+    utc = parsed.astimezone(timezone.utc)
+    uk = parsed.astimezone(_UK_TZ)
+    return {
+        "gameweek": event.get("id"),
+        "deadline_time_utc": utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "deadline_time_uk": uk.isoformat(timespec="seconds"),
+        "deadline_time_uk_display": uk.strftime("%a %d %b %Y, %H:%M %Z"),
+    }
 
 STATUS_LABELS = {
     "a": "available",
@@ -186,6 +227,27 @@ class Index:
 
     def event(self, event_id: int) -> dict | None:
         return next((e for e in self.events if e["id"] == event_id), None)
+
+    @property
+    def next_deadline(self) -> dict | None:
+        """The next gameweek deadline, preferring FPL's `is_next` marker."""
+        event = next((e for e in self.events if e.get("is_next")), None)
+        if event is None:
+            now = datetime.now(timezone.utc)
+            event = next(
+                (
+                    e
+                    for e in self.events
+                    if (deadline := _parse_utc(e.get("deadline_time"))) is not None
+                    and deadline > now
+                ),
+                None,
+            )
+        if event is None:
+            current = self.event(self.current_event) if self.current_event else None
+            event = current
+        return deadline_info(event)
+
 
     @property
     def season_stage(self) -> str:

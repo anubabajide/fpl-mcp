@@ -12,6 +12,17 @@ from typing import Any, Iterable
 
 from .index import Index
 
+# A compact default: identity, price, headline scoring, availability. The full
+# optimiser set below is opt-in via fields="standard" because returning all 62
+# columns for ~700 players overflows many clients' tool-result limits.
+COMPACT_FIELDS: tuple[str, ...] = (
+    "id", "web_name", "team", "team_id", "position", "element_type",
+    "price", "total_points", "points_per_game", "form", "event_points",
+    "ep_next", "minutes", "goals_scored", "assists", "clean_sheets", "bonus",
+    "expected_goal_involvements", "selected_by_percent",
+    "status", "chance_of_playing_next_round", "news",
+)
+
 # A broad, optimiser-oriented default: identity, price, every scoring stat,
 # the underlying-performance columns, availability, and set-piece duty.
 STANDARD_FIELDS: tuple[str, ...] = (
@@ -51,7 +62,7 @@ DERIVED = {
 def player_rows(
     index: Index,
     players: Iterable,
-    fields: tuple[str, ...] | list[str] = STANDARD_FIELDS,
+    fields: tuple[str, ...] | list[str] = COMPACT_FIELDS,
 ) -> list[dict]:
     rows = []
     for p in players:
@@ -70,13 +81,18 @@ def player_rows(
 
 
 def resolve_fields(index: Index, requested) -> list[str]:
-    """`None` -> the standard set, "all" -> every raw column, else as given."""
+    """`None` -> compact set, "standard" -> broad set, "all" -> every raw column."""
     if requested is None:
-        return list(STANDARD_FIELDS)
+        return list(COMPACT_FIELDS)
     if isinstance(requested, str):
-        if requested.lower() == "all":
+        lowered = requested.strip().lower()
+        if lowered == "all":
             sample = next(iter(index.players.values()))
             return ["team", "position", "price"] + sorted(sample.raw.keys())
+        if lowered in ("standard", "full", "optimiser", "optimizer"):
+            return list(STANDARD_FIELDS)
+        if lowered == "compact":
+            return list(COMPACT_FIELDS)
         requested = [f.strip() for f in requested.split(",") if f.strip()]
     known = set(next(iter(index.players.values())).raw.keys()) | set(DERIVED)
     unknown = [f for f in requested if f not in known]
