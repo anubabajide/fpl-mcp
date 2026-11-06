@@ -1,13 +1,13 @@
 """Thin async client over the Fantasy Premier League API."""
 from __future__ import annotations
 
-import base64
 import json
 import time
 from typing import Any
 
 import httpx
 
+from . import auth
 from .config import Config
 
 BASE = "https://fantasy.premierleague.com/api"
@@ -28,12 +28,14 @@ class FPLError(RuntimeError):
 
 
 class AuthError(FPLError):
-    """Raised when the bearer token is missing, malformed or rejected."""
+    """Raised when there is no usable FPL session, or FPL rejects it."""
 
 
 class FPLClient:
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(self, config: Config | None = None, session: auth.Session | None = None) -> None:
         self.config = config or Config.load()
+        self.session = session or auth.Session()
+        self.session.on_browser_used = self._remember_browser
         self._cache: dict[str, tuple[float, Any]] = {}
         self._client: httpx.AsyncClient | None = None
 
@@ -57,51 +59,74 @@ class FPLClient:
             await self._client.aclose()
             self._client = None
 
-    async def ensure_token(self, margin_seconds: int = 120) -> None:
-        """Make sure a usable token is in hand, refreshing from the saved session.
+    def _remember_browser(self, channel: str | None) -> None:
+        if channel != self.config.browser_channel:
+            self.config.browser_channel = channel
+            self.config.save()
 
-        Called before every authenticated request. A token that is missing or
-        about to expire triggers a headless replay of the stored browser
-        session; if that session has itself lapsed the caller is told to run
-        `fpl_login` again.
+    def has_credentials(self) -> bool:
+        """True if authenticated endpoints are worth trying (not that they will work)."""
+        return self.session.has_credentials() or bool(self.config.bearer_token)
+
+    def manual_token(self) -> str | None:
+        token = (self.config.bearer_token or "").strip().removeprefix("Bearer ").strip()
+        return token or None
+
+    async def access_token(self, rejected: str | None = None) -> str:
+        """The token to send, renewing the saved session first if it is near expiry.
+
+        A signed-in session wins over a hand-pasted token, because only the
+        session can renew itself.
         """
-        from . import browser_auth
-
-        left = self.token_seconds_left()
-        if self.config.bearer_token and (left is None or left > margin_seconds):
-            return
-        if not (self.config.browser_session and browser_auth.profile_exists()):
-            if self.config.bearer_token:
-                return  # a manually pasted token; let the API judge it
-            raise AuthError(
-                "Not signed in to FPL. Run the `fpl_login` tool once — it opens a "
-                "browser window for you to sign in, and remembers the session."
-            )
-        try:
-            token, channel = await browser_auth.silent_refresh(
-                preferred_channel=self.config.browser_channel
-            )
-        except browser_auth.BrowserAuthError as exc:
-            raise AuthError(str(exc)) from exc
-        self.config.bearer_token = token
-        self.config.browser_channel = channel
-        self.config.save()
-
-    def _auth_headers(self) -> dict[str, str]:
-        token = (self.config.bearer_token or "").strip()
-        if not token:
-            raise AuthError(
-                "Not signed in to FPL. Run the `fpl_login` tool once — it opens a "
-                "browser window for you to sign in, and remembers the session."
-            )
-        token = token.removeprefix("Bearer ").strip()
+        if self.session.has_credentials():
+            try:
+                return await self.session.access_token(rejected=rejected)
+            except auth.SignInRequired as exc:
+                if not self.manual_token():
+                    raise AuthError(str(exc)) from exc
+            except auth.AuthFailure as exc:
+                raise AuthError(str(exc)) from exc
+        token = self.manual_token()
+        if token is None:
+            message = auth.NOT_SIGNED_IN
+            if auth.legacy_profile_exists():
+                message += (
+                    " This version signs in differently from 0.2.0, so the old saved "
+                    "browser session cannot be reused; sign in once more."
+                )
+            raise AuthError(message)
         if token.count(".") != 2:
             raise AuthError(
-                "The stored token is not a JWT (expected three dot-separated parts). "
+                "The pasted token is not a JWT (expected three dot-separated parts). "
                 "Copy the full value of the `X-Api-Authorization` header, minus the "
-                "leading `Bearer `."
+                "leading `Bearer `. Or better, sign in with `fpl_login`."
             )
-        return {"X-Api-Authorization": f"Bearer {token}"}
+        return token
+
+    async def _send(self, method: str, path: str, *, auth_required: bool, json_body=None) -> Any:
+        http = await self._http()
+        url = f"{BASE}/{path.lstrip('/')}"
+        token = await self.access_token() if auth_required else None
+        for attempt in (1, 2):
+            headers = {"X-Api-Authorization": f"Bearer {token}"} if token else {}
+            try:
+                resp = await http.request(method, url, headers=headers, json=json_body)
+            except httpx.HTTPError as exc:
+                raise FPLError(f"Network error calling FPL API: {exc}") from exc
+            # A 401 means the token was refused before anything happened, so one
+            # retry with a renewed token is safe even for a POST.
+            if (
+                resp.status_code == 401
+                and token
+                and attempt == 1
+                and self.session.has_credentials()
+                and token != self.manual_token()
+            ):
+                renewed = await self.access_token(rejected=token)
+                if renewed != token:
+                    token = renewed
+                    continue
+            return self._unwrap(resp, path)
 
     async def _get(self, path: str, ttl: int = 0, auth: bool = False) -> Any:
         key = f"GET {path} auth={auth}"
@@ -109,41 +134,26 @@ class FPLClient:
             hit = self._cache.get(key)
             if hit and time.monotonic() - hit[0] < ttl:
                 return hit[1]
-
-        http = await self._http()
-        if auth:
-            await self.ensure_token()
-        headers = self._auth_headers() if auth else {}
-        try:
-            resp = await http.get(f"{BASE}/{path.lstrip('/')}", headers=headers)
-        except httpx.HTTPError as exc:
-            raise FPLError(f"Network error calling FPL API: {exc}") from exc
-
-        data = self._unwrap(resp, path)
+        data = await self._send("GET", path, auth_required=auth)
         if ttl:
             self._cache[key] = (time.monotonic(), data)
         return data
 
     async def _post(self, path: str, payload: dict) -> Any:
-        http = await self._http()
-        await self.ensure_token()
-        headers = self._auth_headers() | {"Content-Type": "application/json"}
-        try:
-            resp = await http.post(
-                f"{BASE}/{path.lstrip('/')}", headers=headers, json=payload
-            )
-        except httpx.HTTPError as exc:
-            raise FPLError(f"Network error calling FPL API: {exc}") from exc
-        return self._unwrap(resp, path)
+        return await self._send("POST", path, auth_required=True, json_body=payload)
 
     @staticmethod
     def _unwrap(resp: httpx.Response, path: str) -> Any:
-        if resp.status_code in (401, 403):
+        if resp.status_code == 401:
             raise AuthError(
-                f"FPL rejected the request to /{path} ({resp.status_code}). The token "
-                f"is stale and the saved browser session could not renew it, so the "
-                f"session itself has most likely expired — run `fpl_login` to sign in "
-                f"again. Server said: {resp.text[:300]}"
+                f"FPL rejected the session token on /{path} (401). Sign in again with "
+                f"`fpl_login`. Server said: {resp.text[:300]}"
+            )
+        if resp.status_code == 403:
+            raise AuthError(
+                f"FPL refused access to /{path} (403). That endpoint only works for the "
+                f"signed-in manager's own team; if this is your team, sign in again "
+                f"with `fpl_login`. Server said: {resp.text[:300]}"
             )
         if resp.status_code >= 400:
             raise FPLError(f"FPL API error {resp.status_code} on /{path}: {resp.text[:500]}")
@@ -209,22 +219,3 @@ class FPLClient:
                 "chip": chip,
             },
         )
-
-    # ------------------------------------------------------------------ tokens
-    def token_claims(self) -> dict:
-        """Decode the JWT payload without verifying it (we are not the issuer)."""
-        token = (self.config.bearer_token or "").strip().removeprefix("Bearer ").strip()
-        if token.count(".") != 2:
-            return {}
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        try:
-            return json.loads(base64.urlsafe_b64decode(payload))
-        except Exception:
-            return {}
-
-    def token_seconds_left(self) -> int | None:
-        exp = self.token_claims().get("exp")
-        if not isinstance(exp, (int, float)):
-            return None
-        return int(exp - time.time())

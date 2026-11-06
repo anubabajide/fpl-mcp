@@ -10,6 +10,8 @@ offenders for both size and path depth.
 import json, os, shutil, subprocess, sys, zipfile
 from pathlib import Path
 
+from fpl_mcp import __version__
+
 SRC = Path(__file__).resolve().parent
 STAGE = Path(os.environ.get("TEMP", "C:/Temp")) / "fb"
 OUT = SRC / "fpl.mcpb"
@@ -75,7 +77,7 @@ def main():
         "manifest_version": "0.3",
         "name": "fpl",
         "display_name": "Fantasy Premier League",
-        "version": "0.2.0",
+        "version": __version__,
         "description": "Manage your Fantasy Premier League team from Claude.",
         "long_description": (
             "Read your squad and season stats, rank the best performers in the game, "

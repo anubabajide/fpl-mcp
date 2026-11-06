@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -18,7 +19,7 @@ from .analysis import (
     validate_lineup,
     validate_squad,
 )
-from . import browser_auth
+from . import __version__, auth
 from .client import AuthError, FPLClient, FPLError
 from .export import (
     LIVE_ROW_FIELDS,
@@ -37,11 +38,14 @@ from .pulse import PulseClient, lineup_players
 INSTRUCTIONS = """Manage a Fantasy Premier League team.
 
 Read-only tools work with no credentials beyond a team id. Writing to the team
-(`fpl_set_lineup`, `fpl_set_captain`, `fpl_make_transfers`) needs a signed-in FPL
-session. `fpl_login` is a two-step tool: the first call opens a browser window on
-the user's machine and returns immediately with status "waiting"; after they sign
-in, call it a second time to store the session. Do not treat "waiting" as failure.
-The session is then reused and renewed automatically.
+(`fpl_set_lineup`, `fpl_set_captain`, `fpl_make_transfers`) needs the user signed
+in to FPL. `fpl_login` opens FPL's own sign-in page in a browser window on the
+user's machine and returns while they sign in. The session saves itself when
+they finish, so do not call `fpl_login` again: wait for the user to say they are
+done, then confirm with `fpl_auth_status`. If `fpl_login` returns status
+"awaiting_redirect_url", no window could be opened: give the user `sign_in_url`,
+and when they paste back the address they landed on, pass it to `fpl_login` as
+`redirect_url`. Once signed in, the session renews itself without a browser.
 
 Every write defaults to `dry_run=true`, which validates and previews the change
 without submitting it. Always show the user that preview and get their agreement
@@ -51,7 +55,7 @@ before calling again with `dry_run=false`.
 server = MCPServer(
     name="fpl",
     title="Fantasy Premier League",
-    version="0.2.0",
+    version=__version__,
     instructions=INSTRUCTIONS,
 )
 
@@ -144,161 +148,209 @@ async def fpl_setup(
             ).strip()
         except FPLError as exc:
             out["warning"] = "Could not verify that team id: " + str(exc)
-    out["has_bearer_token"] = bool(cfg.bearer_token)
+    out["signed_in"] = client.has_credentials()
     return out
 
 
-_login_task: "asyncio.Task[str] | None" = None
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_HINT = "Run the `fpl_login` tool: it opens FPL's sign-in page in a browser window."
+
+
+def _sign_in_link(pending: auth.PendingSignIn) -> dict:
+    return {
+        "sign_in_url": pending.authorize_url,
+        "how_to_finish": (
+            "Open sign_in_url in any browser and sign in. FPL then sends you to a page "
+            "whose address starts with " + auth.REDIRECT_URI + "?code= . Copy that whole "
+            "address straight away, then pass it to fpl_login as redirect_url."
+        ),
+    }
+
+
+async def _whoami(client: FPLClient) -> dict:
+    """Who FPL says is signed in. Also stores their team id if none is set yet."""
+    try:
+        me = await client.me()
+    except FPLError as exc:
+        return {"identity_check_failed": str(exc)}
+    player = (me or {}).get("player") or {}
+    if not player:
+        return {"identity_check_failed": "FPL did not recognise the session."}
+    out: dict[str, Any] = {"logged_in_as": player.get("first_name"), "entry_id": player.get("entry")}
+    if not client.config.team_id and player.get("entry"):
+        client.config.team_id = int(player["entry"])
+        client.config.save()
+        out["team_id_saved"] = client.config.team_id
+    return out
 
 
 @server.tool()
-async def fpl_login(wait_seconds: int = 15, timeout_seconds: int = 600) -> dict:
-    """Sign in to FPL in a real browser window, and remember the session.
+async def fpl_login(
+    redirect_url: str | None = None,
+    open_browser: bool = True,
+    force: bool = False,
+    wait_seconds: int = 20,
+) -> dict:
+    """Sign in to FPL. Needed only for lineup changes and transfers.
 
-    This returns quickly rather than blocking while you sign in. The first call
-    opens a browser window on the machine running this server and returns
-    `status: "waiting"`. Sign in there, then **call this tool again** to finish
-    and store the session.
+    Opens FPL's own sign-in page in a browser window on the machine running this
+    server, and returns within `wait_seconds` while the user signs in there.
+    Password, two-factor and any bot check happen on FPL's page; no credentials
+    pass through this server. The session is saved automatically when they
+    finish, so there is no need to call this again: wait for the user to say
+    they are done, then confirm with `fpl_auth_status`.
 
-    Signing in happens entirely in that window — password, two-factor and any bot
-    check are handled by you, and no credentials pass through this server. Once
-    stored, tokens renew silently, so this should be a rare, one-off step.
+    If `status` is "awaiting_redirect_url", no window could be opened (or
+    `open_browser` was false). Give the user `sign_in_url` to open in any
+    browser. After signing in they land on a page whose address starts with
+    https://fantasy.premierleague.com/?code= and should paste that address
+    back; call this again with it as `redirect_url` to finish.
+
+    Once signed in, the session renews itself without a browser. If already
+    signed in this returns straight away; `force=true` signs in afresh.
     """
-    global _login_task
     client = get_client()
+    session = client.session
 
-    def _finish(result: tuple) -> dict:
-        token, channel = result
-        client.config.bearer_token = token
-        client.config.browser_session = True
-        client.config.browser_channel = channel
-        client.config.save()
-        return {
-            "signed_in": True,
-            "status": "complete",
-            "message": "Signed in and session saved. Future tokens renew automatically.",
-            "browser_used": channel or "bundled chromium",
-            "session_profile": str(browser_auth.PROFILE_DIR),
-        }
-
-    # A previous call left a finished attempt behind — collect its outcome.
-    if _login_task is not None and _login_task.done():
-        task, _login_task = _login_task, None
+    if redirect_url:
+        if session.pending is None and session.has_credentials():
+            return {"signed_in": True, "status": "already_signed_in", **await _whoami(client)}
         try:
-            return _finish(task.result())
-        except browser_auth.BrowserAuthError as exc:
+            await session.complete_login(redirect_url)
+        except auth.AuthFailure as exc:
+            return {"signed_in": False, "status": "failed", "error": str(exc)}
+        return {"signed_in": True, "status": "complete", **await _whoami(client)}
+
+    if not force and session.has_credentials() and not session.login_in_progress:
+        try:
+            await session.access_token()
+        except auth.SignInRequired:
+            pass  # the saved session has lapsed; sign in afresh below
+        except auth.AuthFailure as exc:
+            # FPL's sign-in service is unreachable. A new window would not help.
+            return {"signed_in": False, "status": "error", "error": str(exc)}
+        else:
             return {
-                "signed_in": False,
-                "status": "failed",
-                "error": str(exc),
-                "next_step": "Call fpl_login again to open a fresh window.",
+                "signed_in": True,
+                "status": "already_signed_in",
+                "message": "Already signed in; the session renews itself. Pass force=true to sign in again.",
+                **await _whoami(client),
             }
-        except asyncio.CancelledError:
-            return {"signed_in": False, "status": "cancelled"}
 
-    if _login_task is None:
-        # Runs as an independent task so it survives this tool call returning,
-        # or the client giving up on it.
-        _login_task = asyncio.create_task(
-            browser_auth.interactive_login(
-                timeout_seconds=timeout_seconds,
-                preferred_channel=client.config.browser_channel,
-            )
-        )
+    pending = session.start_login(
+        open_browser=open_browser,
+        preferred_channel=client.config.browser_channel,
+        timeout_seconds=LOGIN_WINDOW_SECONDS,
+    )
+    if not open_browser:
+        return {"signed_in": False, "status": "awaiting_redirect_url", **_sign_in_link(pending)}
 
-    # Shielded: a timeout here must not cancel a sign-in already in progress.
-    try:
-        token = await asyncio.wait_for(asyncio.shield(_login_task), timeout=wait_seconds)
-    except asyncio.TimeoutError:
+    # The sign-in carries on in the background if this wait runs out.
+    if not await session.wait_for_login(max(0, min(wait_seconds, 45))):
         return {
             "signed_in": False,
-            "status": "waiting",
+            "status": "awaiting_browser",
             "message": (
-                "A browser window is open on the machine running this server. "
-                "Sign in to FPL there, then call fpl_login again to finish."
+                "FPL's sign-in page is open in a browser window on the machine running "
+                "this server. Sign in there; the session saves itself when you finish."
             ),
-            "window_open_for_seconds": timeout_seconds,
-        }
-    except browser_auth.BrowserAuthError as exc:
-        _login_task = None
-        return {
-            "signed_in": False,
-            "status": "failed",
-            "error": str(exc),
-            "next_step": "Call fpl_login again to open a fresh window.",
+            "next_step": "When the user says they have signed in, call fpl_auth_status to confirm.",
+            "if_no_window_appeared": _sign_in_link(pending),
         }
 
-    _login_task = None
-    return _finish(token)
+    error = session.last_login_error
+    if error is None and session.has_credentials():
+        return {"signed_in": True, "status": "complete", **await _whoami(client)}
+    if isinstance(error, auth.BrowserUnavailable) and session.pending is not None:
+        return {
+            "signed_in": False,
+            "status": "awaiting_redirect_url",
+            "browser_error": str(error),
+            **_sign_in_link(session.pending),
+        }
+    return {
+        "signed_in": False,
+        "status": "failed",
+        "error": str(error) if error else "Sign-in did not finish.",
+        "next_step": "Call fpl_login again to retry.",
+    }
 
 
 @server.tool()
 async def fpl_logout() -> dict:
-    """Forget the saved browser session and the stored token."""
+    """Sign out: delete the saved session from this machine and revoke it at FPL."""
     client = get_client()
-    browser_auth.clear_profile()
+    revoked = await client.session.sign_out()
     client.config.bearer_token = None
-    client.config.browser_session = False
-    client.config.save()
-    return {"signed_out": True, "message": "Saved session and token cleared."}
+    return {
+        "signed_out": True,
+        "revoked_at_fpl": revoked,
+        "message": "Saved session deleted from this machine"
+        + (" and revoked at FPL." if revoked else "."),
+    }
 
 
 @server.tool()
 async def fpl_auth_status() -> dict:
-    """Check whether the FPL session is usable, and renew the token if needed.
+    """Check whether you are signed in to FPL, renewing the session if needed.
 
-    Read-only tools never need this. Only lineup changes and transfers do.
+    Also reports progress of a sign-in started with `fpl_login`. Read-only tools
+    never need this; only lineup changes and transfers do.
     """
     client = get_client()
-    hint = "Run the `fpl_login` tool — it opens a browser window for you to sign in."
+    session = client.session
+    result: dict[str, Any] = {}
+    sign_in = session.login_status()
+    if sign_in:
+        result["sign_in"] = sign_in
 
-    signed_in = client.config.browser_session and browser_auth.profile_exists()
-    if not client.config.bearer_token and not signed_in:
-        return {"authenticated": False, "reason": "Not signed in.", "next_step": hint}
-
-    try:
-        await client.ensure_token()
-    except AuthError as exc:
-        return {"authenticated": False, "reason": str(exc), "next_step": hint}
-
-    seconds_left = client.token_seconds_left()
-    result: dict[str, Any] = {"saved_session": signed_in}
-    if client.config.browser_channel:
-        result["browser_used"] = client.config.browser_channel
-    if seconds_left is not None:
-        result["token_expires_in_seconds"] = seconds_left
+    if not client.has_credentials():
+        if session.login_in_progress:
+            next_step = "Finish signing in in the browser window; the session saves itself."
+        elif session.pending is not None:
+            next_step = "Open sign_in_url, sign in, then pass the address you land on to fpl_login as redirect_url."
+        else:
+            next_step = LOGIN_HINT
+        result.update(authenticated=False, reason="Not signed in.", next_step=next_step)
+        return result
 
     try:
-        me = await client.me()
+        token = await client.access_token()
     except AuthError as exc:
-        return {"authenticated": False, "reason": str(exc), "next_step": hint}
-    player = me.get("player") or {}
-    result["authenticated"] = bool(player)
-    if player:
-        result["logged_in_as"] = player.get("first_name")
-        result["entry_id"] = player.get("entry")
-        if not client.config.team_id and player.get("entry"):
-            client.config.team_id = player["entry"]
-            client.config.save()
-            result["team_id_saved"] = player["entry"]
+        result.update(authenticated=False, reason=str(exc), next_step=LOGIN_HINT)
+        return result
+
+    tokens = session.tokens()
+    if tokens is not None and token == tokens.access_token:
+        result["method"] = "fpl_sign_in"
+        result["renews_automatically"] = bool(tokens.refresh_token)
+        result["token_expires_in_seconds"] = tokens.seconds_left()
     else:
-        result["reason"] = "FPL did not recognise the token."
-        result["next_step"] = hint
+        result["method"] = "pasted_token"
+        result["renews_automatically"] = False
+        exp = auth.jwt_claims(token).get("exp")
+        if isinstance(exp, (int, float)):
+            result["token_expires_in_seconds"] = int(exp - time.time())
+
+    identity = await _whoami(client)
+    result["authenticated"] = "identity_check_failed" not in identity
+    result.update(identity)
+    if not result["authenticated"]:
+        result["next_step"] = LOGIN_HINT
     return result
 
 
 @server.tool()
 async def fpl_set_token(token: str) -> dict:
-    """Store a bearer token by hand. Fallback for when `fpl_login` cannot run.
+    """Last-resort fallback: use a bearer token copied by hand from DevTools.
 
-    `fpl_login` is the normal route. Use this only if the browser session will
-    not work on this machine: copy the `X-Api-Authorization` header value from a
-    logged-in browser's DevTools Network tab, minus the leading `Bearer `. A
-    hand-pasted token lasts about an hour and cannot renew itself.
+    Prefer `fpl_login`, including its sign-in link for machines that cannot open
+    a browser. A pasted token is the `X-Api-Authorization` header value from a
+    signed-in browser's DevTools Network tab, minus the leading `Bearer `. It
+    lasts about an hour, cannot renew itself, and is kept in memory only.
     """
     client = get_client()
     client.config.bearer_token = token.strip().removeprefix("Bearer ").strip()
-    client.config.save()
     return await fpl_auth_status()
 
 
@@ -324,7 +376,7 @@ async def fpl_my_squad(team_id: int | None = None, gameweek: int | None = None) 
         pass
 
     picks: list[dict] = []
-    if gameweek is None and client.config.bearer_token:
+    if gameweek is None and client.has_credentials():
         try:
             live = await client.my_team(entry_id)
             picks = live.get("picks", [])
@@ -351,8 +403,8 @@ async def fpl_my_squad(team_id: int | None = None, gameweek: int | None = None) 
         except FPLError as exc:
             raise FPLError(
                 "Could not read your squad for gameweek " + str(event) + ". Before the "
-                "season's first deadline FPL does not publish squads, so store a token "
-                "with `fpl_set_token` to see your draft team. (" + str(exc) + ")"
+                "season's first deadline FPL does not publish squads, so sign in with "
+                "`fpl_login` to see your draft team. (" + str(exc) + ")"
             ) from exc
         picks = data.get("picks", [])
         result["source"] = "confirmed squad for gameweek " + str(event)
@@ -519,7 +571,7 @@ async def fpl_best_performers(
 
 async def _current_squad_ids(client: FPLClient, index: Index, entry_id: int) -> list[int]:
     """Best available view of the 15 players currently in a squad."""
-    if client.config.bearer_token:
+    if client.has_credentials():
         try:
             live = await client.my_team(entry_id)
             return [p["element"] for p in live.get("picks", [])]
@@ -533,8 +585,8 @@ async def _current_squad_ids(client: FPLClient, index: Index, entry_id: int) -> 
     except FPLError as exc:
         raise FPLError(
             "Could not read squad " + str(entry_id) + " for gameweek " + str(event)
-            + ". FPL only publishes squads once a deadline has passed; store a token "
-            "with `fpl_set_token` to read your draft squad before then. (" + str(exc) + ")"
+            + ". FPL only publishes squads once a deadline has passed; sign in with "
+            "`fpl_login` to read your draft squad before then. (" + str(exc) + ")"
         ) from exc
     return [p["element"] for p in data.get("picks", [])]
 

@@ -1,9 +1,14 @@
-"""Configuration and credential storage for the FPL MCP server."""
+"""Configuration storage for the FPL MCP server.
+
+Credentials do not live here: a signed-in FPL session is kept by `auth.TokenStore`
+in its own owner-only file. This file holds only non-sensitive settings.
+"""
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, asdict
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 CONFIG_DIR = Path(os.environ.get("FPL_MCP_HOME") or (Path.home() / ".fpl-mcp"))
@@ -13,13 +18,15 @@ CACHE_DIR = CONFIG_DIR / "cache"
 
 @dataclass
 class Config:
-    """Persisted settings. Env vars always win over the config file."""
+    """Settings for one local FPL user. Env vars always win over the file."""
 
     team_id: int | None = None
-    bearer_token: str | None = None
     default_league_id: int | None = None
-    browser_session: bool = False
+    # Which browser last opened the sign-in window successfully, tried first next time.
     browser_channel: str | None = None
+    # A bearer token pasted by hand (`fpl_set_token`) or set via FPL_BEARER_TOKEN.
+    # Held in memory only: it cannot renew itself, so persisting it buys nothing.
+    bearer_token: str | None = None
 
     @classmethod
     def load(cls) -> "Config":
@@ -32,11 +39,15 @@ class Config:
 
         cfg = cls(
             team_id=_int_or_none(data.get("team_id")),
-            bearer_token=data.get("bearer_token") or None,
             default_league_id=_int_or_none(data.get("default_league_id")),
-            browser_session=bool(data.get("browser_session")),
             browser_channel=data.get("browser_channel") or None,
         )
+        # Version 0.2.0 wrote the bearer token into this file. Rewrite it without.
+        if "bearer_token" in data or "browser_session" in data:
+            try:
+                cfg.save()
+            except OSError:
+                pass
 
         if os.environ.get("FPL_TEAM_ID"):
             cfg.team_id = _int_or_none(os.environ["FPL_TEAM_ID"])
@@ -47,12 +58,42 @@ class Config:
         return cfg
 
     def save(self) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
-        try:  # best effort: keep the token file owner-only
-            CONFIG_PATH.chmod(0o600)
+        write_private_json(
+            CONFIG_PATH,
+            {
+                "team_id": self.team_id,
+                "default_league_id": self.default_league_id,
+                "browser_channel": self.browser_channel,
+            },
+        )
+
+
+def write_private_json(path: Path, data: dict) -> None:
+    """Write JSON readable only by the current user, replacing the file atomically.
+
+    The atomic replace means a process stopped mid-write can never leave a
+    truncated file behind. Permissions are best effort: on Windows the file
+    inherits the ACL of the user's profile directory instead.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.chmod(0o700)
+    except OSError:
+        pass
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", delete=False
+    ) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        try:
+            tmp_path.chmod(0o600)  # before any content is written
         except OSError:
             pass
+        tmp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _int_or_none(value) -> int | None:

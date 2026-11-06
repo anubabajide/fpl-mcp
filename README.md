@@ -54,8 +54,8 @@ Create a protected GitHub environment named `pypi` (for example, require manual
 approval). Once that one-time setup is complete, publish a prepared version with:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 Playwright drives the one-off browser sign-in described under Authentication.
@@ -141,23 +141,30 @@ be running for the connector to work.
 Everything read-only works with no login at all. Only the three write tools
 (`fpl_set_lineup`, `fpl_set_captain`, `fpl_make_transfers`) need a session.
 
-**Sign in once:** ask Claude to run `fpl_login`. It is deliberately a **two-step**
-tool, because a sign-in takes longer than an MCP client will wait for a tool call:
+**Sign in once:** ask Claude to run `fpl_login`. It opens FPL's own sign-in page
+in a browser window on the machine running the server and returns promptly:
 
-1. The first call opens a browser window on the machine running the server and
-   returns straight away with `status: "waiting"`.
-2. You sign in there.
-3. Claude calls `fpl_login` again, which collects the session and stores it.
+1. Sign in in that browser window.
+2. The server catches the redirect FPL sends back, exchanges the authorization
+   code, and saves the resulting session automatically — there is no second
+   `fpl_login` call.
 
 The sign-in runs as an independent background task, so it keeps going even if the
 client gives up on the first call — your progress in the window is never thrown
-away. You sign in yourself. The session is saved to a local
-browser profile at `~/.fpl-mcp/browser-profile`, and from then on the server
-replays it headlessly to mint fresh bearer tokens on demand. You should not need
-to think about tokens again until the session itself lapses, at which point any
-write tool will tell you to run `fpl_login` again.
+away. You sign in yourself; this server never sees your password. The session is
+kept as a refresh token in `~/.fpl-mcp/credentials.json`, readable only by you,
+and access tokens are renewed with a single HTTPS request. No browser is involved
+after sign-in. You should not need to think about tokens again until the session
+itself lapses, at which point any write tool will tell you to run `fpl_login`
+again. `fpl_auth_status` can check whether a browser sign-in has finished.
 
-`fpl_logout` forgets the session. `fpl_auth_status` reports the current state.
+If no browser window can be opened, `fpl_login` returns status
+`awaiting_redirect_url` with a `sign_in_url`. Open that link in any browser; after
+signing in, paste the address you land on back into `fpl_login` as
+`redirect_url`.
+
+`fpl_logout` forgets the session and revokes it at FPL. `fpl_auth_status` reports
+the current state.
 
 ### Why not just store an email and password?
 
@@ -174,10 +181,10 @@ POST https://account.premierleague.com/as/token
 The supported flow is authorization-code + PKCE in a browser, and
 `account.premierleague.com` rejects non-browser HTTP clients outright. So a real
 browser has to be involved somewhere. Doing it this way means the login is
-performed by you, in a genuine browser window, and **no FPL credentials are ever
-stored, read, or handled by this server** — it only ever sees the resulting
-session cookie in the browser profile, and the bearer token the FPL web app
-attaches to its own API calls.
+performed by you, on FPL's own page in a genuine browser window, and **no FPL
+credentials are ever stored, read, or handled by this server**. The authorization
+code is redeemed with a PKCE verifier held only in memory, and what is saved
+afterwards is a refresh token — not a password and not a browser profile.
 
 If the login ever presents two-factor or a bot check, you complete it in that
 window like any other sign-in. Nothing is bypassed.
@@ -186,7 +193,7 @@ window like any other sign-in. Nothing is bypassed.
 
 `fpl_set_token` still accepts a bearer token pasted by hand from DevTools, for
 machines where launching a browser is not an option. Such a token lasts about an
-hour and cannot renew itself.
+hour, cannot renew itself, and is retained only until the server stops.
 
 ## Tools
 
@@ -344,5 +351,5 @@ numbers don't get read as current-season form. Newly promoted clubs and new sign
 have no history at all.
 
 FPL also doesn't publish anyone's squad until the first deadline passes, so before
-then `fpl_my_squad` and `fpl_differentials` need a stored token to read your draft
-team, and mini-league tables are empty.
+then `fpl_my_squad` and `fpl_differentials` need a signed-in session to read your
+draft team, and mini-league tables are empty.
