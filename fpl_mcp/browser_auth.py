@@ -46,9 +46,8 @@ def _require_playwright():
         from playwright.async_api import async_playwright
     except ImportError as exc:  # pragma: no cover - depends on install state
         raise BrowserAuthError(
-            "Playwright is not installed. Run:\n"
-            "  .venv/Scripts/python.exe -m pip install playwright\n"
-            "  .venv/Scripts/python.exe -m playwright install chromium"
+            "Playwright is not installed. Reinstall the server, then run:\n"
+            "  playwright install chromium"
         ) from exc
     return async_playwright
 

@@ -1,17 +1,61 @@
-# fpl-mcp
+# Fantasy Premier League MCP
+
+<!-- mcp-name: io.github.anubabajide/fpl -->
 
 An MCP server that lets Claude manage your Fantasy Premier League team — read your
 squad and stats, rank players, work out differentials, and make changes to your team.
 
+This project is packaged on PyPI as `fantasy-premier-league-mcp`, rather than
+`fpl-mcp`, which is already owned by an unrelated project.
+
 ## Install
 
-The virtual environment is already created in this folder. If you ever need to
-rebuild it:
+Install it with [`uv`](https://docs.astral.sh/uv/) (recommended):
 
 ```bash
-python -m venv .venv
-.venv/Scripts/python.exe -m pip install mcp httpx playwright
-.venv/Scripts/python.exe -m playwright install chromium
+uv tool install fantasy-premier-league-mcp
+```
+
+Or run it without installing:
+
+```bash
+uvx fantasy-premier-league-mcp
+```
+
+`fpl_login` also needs a local Chromium installation. Install it once with:
+
+```bash
+uvx --from playwright playwright install chromium
+```
+
+For development, create a virtual environment and install the project:
+
+```bash
+uv sync --group dev
+uv run playwright install chromium
+```
+
+## Releasing
+
+Releases are published by GitHub Actions when a matching version tag is pushed.
+The workflow tests and builds the package, publishes it to PyPI using Trusted
+Publishing, then publishes the matching `server.json` to the official MCP
+Registry. No PyPI API token is stored in GitHub.
+
+Before the first release, configure a PyPI **pending Trusted Publisher** with:
+
+- owner: `anubabajide`
+- repository: `fpl-mcp`
+- workflow: `release.yml`
+- environment: `pypi`
+- PyPI project: `fantasy-premier-league-mcp`
+
+Create a protected GitHub environment named `pypi` (for example, require manual
+approval). Once that one-time setup is complete, publish a prepared version with:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Playwright drives the one-off browser sign-in described under Authentication.
@@ -32,7 +76,7 @@ dependencies and a bundled Python interpreter, plus a `manifest.json`.
 3. Set your FPL Team ID (and optionally a default mini-league ID) when prompted
 
 You run nothing; the app launches the server itself. Rebuild after code changes
-with `.venv/Scripts/python.exe build_mcpb.py`.
+with `uv run python build_mcpb.py` on Windows.
 
 #### Updating an installed version — stop the server first
 

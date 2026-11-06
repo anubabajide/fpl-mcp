@@ -75,7 +75,7 @@ def main():
         "manifest_version": "0.3",
         "name": "fpl",
         "display_name": "Fantasy Premier League",
-        "version": "0.5.1",
+        "version": "0.2.0",
         "description": "Manage your Fantasy Premier League team from Claude.",
         "long_description": (
             "Read your squad and season stats, rank the best performers in the game, "

@@ -51,7 +51,7 @@ before calling again with `dry_run=false`.
 server = MCPServer(
     name="fpl",
     title="Fantasy Premier League",
-    version="0.5.1",
+    version="0.2.0",
     instructions=INSTRUCTIONS,
 )
 
@@ -1146,7 +1146,7 @@ async def _fetch_headlines(limit: int) -> list[dict]:
     }
     out: list[dict] = []
     async with httpx.AsyncClient(timeout=15,
-                                 headers={"User-Agent": "fpl-mcp/0.5"}) as http:
+                                 headers={"User-Agent": "fantasy-premier-league-mcp/0.2"}) as http:
         for source, url in feeds.items():
             taken = 0
             try:
